@@ -10,6 +10,9 @@
 #include <mbedtls/sha256.h>
 #include <limits.h>
 #include <esp_ota_ops.h>
+#include <esp_system.h>
+#include <mbedtls/pk.h>
+#include <mbedtls/ecp.h>
 
 // ======================================================
 // ESP32-C3 OTA TEST
@@ -23,7 +26,7 @@
 // - aktualizacja tylko do wersji NOWSZEJ
 // ======================================================
 
-#define CURRENT_VERSION "1.0.9"
+#define CURRENT_VERSION "1.0.10"
 
 const char* VERSION_URL =
   "https://raw.githubusercontent.com/irpak/ESP32-C3-OTA-TEST/main/ota/version.txt";
@@ -742,6 +745,13 @@ void checkForUpdate()
     return;
 
   Serial.println("OTA OK — SHA-256 zweryfikowane.");
+  Preferences marker;
+  if (marker.begin("ota", false))
+  {
+    uint8_t attempt[8]; esp_fill_random(attempt, sizeof(attempt)); char id[17];
+    for (int i=0;i<8;i++) sprintf(id+i*2, "%02x", attempt[i]); id[16]=0;
+    marker.putString("expected_target", remoteVersion); marker.putBool("boot_expected", true); marker.putString("attempt_id", id); marker.end();
+  }
   delay(1000);
   ESP.restart();
 }
@@ -806,6 +816,107 @@ void serviceOtaHealth()
 // SETUP
 // ======================================================
 
+// Signed outbound telemetry foundation.  This subsystem is deliberately
+// independent from rollback health and never runs from verifyRollbackLater().
+const char* TELEMETRY_BROKER = "broker.hivemq.com";
+const uint16_t TELEMETRY_PORT = 8883;
+const char* TELEMETRY_NAMESPACE = "7a4e5c2d-2d95-4a4f-9b31-0cb9c70a4e1b";
+WiFiClientSecure telemetryClient;
+Preferences telemetryPreferences;
+mbedtls_pk_context telemetryKey;
+bool telemetryKeyReady = false;
+String telemetryDeviceId;
+uint8_t telemetryPublicDer[160]; size_t telemetryPublicDerLen = 0;
+uint64_t telemetrySeq = 0;
+unsigned long telemetryLastPublish = 0;
+unsigned long telemetryNextAttempt = 0; uint32_t telemetryBackoff = 5000;
+
+int telemetryRng(void*, unsigned char* out, size_t len)
+{
+  esp_fill_random(out, len);
+  return 0;
+}
+
+String telemetryBase64(const uint8_t* data, size_t len)
+{
+  static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  String out;
+  for (size_t i = 0; i < len; i += 3)
+  {
+    uint32_t value = (uint32_t)data[i] << 16;
+    if (i + 1 < len) value |= (uint32_t)data[i + 1] << 8;
+    if (i + 2 < len) value |= data[i + 2];
+    out += alphabet[(value >> 18) & 63]; out += alphabet[(value >> 12) & 63];
+    out += (i + 1 < len) ? alphabet[(value >> 6) & 63] : '=';
+    out += (i + 2 < len) ? alphabet[value & 63] : '=';
+  }
+  return out;
+}
+
+bool initializeTelemetryIdentity()
+{
+  if (telemetryKeyReady) return true;
+  telemetryPreferences.begin("telemetry", false);
+  uint8_t privateDer[256], publicDer[160];
+  size_t privateLen = telemetryPreferences.getBytes("priv", privateDer, sizeof(privateDer));
+  size_t publicLen = telemetryPreferences.getBytes("pub", publicDer, sizeof(publicDer));
+  mbedtls_pk_init(&telemetryKey);
+  bool loaded = privateLen && publicLen &&
+                mbedtls_pk_parse_key(&telemetryKey, privateDer, privateLen, nullptr, 0, telemetryRng, nullptr) == 0;
+  if (!loaded)
+  {
+    mbedtls_pk_free(&telemetryKey); mbedtls_pk_init(&telemetryKey);
+    if (mbedtls_pk_setup(&telemetryKey, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY)) != 0 ||
+        mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, mbedtls_pk_ec(telemetryKey), telemetryRng, nullptr) != 0)
+    { telemetryPreferences.end(); return false; }
+    privateLen = mbedtls_pk_write_key_der(&telemetryKey, privateDer, sizeof(privateDer));
+    publicLen = mbedtls_pk_write_pubkey_der(&telemetryKey, publicDer, sizeof(publicDer));
+    if ((int)privateLen <= 0 || (int)publicLen <= 0) { telemetryPreferences.end(); return false; }
+    telemetryPreferences.putBytes("priv", privateDer + sizeof(privateDer) - privateLen, privateLen);
+    telemetryPreferences.putBytes("pub", publicDer + sizeof(publicDer) - publicLen, publicLen);
+  }
+  uint8_t digestBytes[32]; mbedtls_sha256(publicDer + sizeof(publicDer) - publicLen, publicLen, digestBytes, 0);
+  char hex[65]; for (int i = 0; i < 32; ++i) sprintf(hex + i * 2, "%02x", digestBytes[i]); hex[64] = 0;
+  memcpy(telemetryPublicDer, publicDer + sizeof(publicDer) - publicLen, publicLen); telemetryPublicDerLen = publicLen;
+  telemetryDeviceId = String(hex); telemetryKeyReady = true; telemetryPreferences.end();
+  return true;
+}
+
+bool telemetryPublishStatus()
+{
+  if (!telemetryKeyReady || WiFi.status() != WL_CONNECTED || (long)(millis()-telemetryNextAttempt)<0) return false;
+  if (!telemetryClient.connected())
+  {
+    telemetryClient.setCACertBundle(x509_crt_bundle, x509_crt_bundle_length);
+    if (!telemetryClient.connect(TELEMETRY_BROKER, TELEMETRY_PORT)) { telemetryNextAttempt=millis()+telemetryBackoff; telemetryBackoff=min<uint32_t>(telemetryBackoff*2,60000); return false; }
+    uint8_t connectPacket[] = {0x10,19,0,4,'M','Q','T','T',4,2,0,60,0,6,'e','s','p','3','2'};
+    telemetryClient.write(connectPacket, sizeof(connectPacket));
+    unsigned long wait=millis(); while(telemetryClient.available()<2 && millis()-wait<2000) yield(); if(telemetryClient.available()<2 || telemetryClient.read()!=0x20 || telemetryClient.read()!=0x00) { telemetryClient.stop(); return false; } telemetryBackoff=5000;
+  }
+  ++telemetrySeq;
+  String payload = String("{\"schema_version\":1,\"device_id\":\"") + telemetryDeviceId +
+    "\",\"chip_family\":\"ESP32-C3\",\"fw_version\":\"" + CURRENT_VERSION +
+    "\",\"seq\":" + String((unsigned long long)telemetrySeq) +
+    ",\"uptime_s\":" + String(millis() / 1000) + ",\"wifi_connected\":true,\"wifi_rssi\":" + String(WiFi.RSSI()) +
+    ",\"ota_state\":\"stable\",\"ota_result\":\"no_update\",\"health_state\":\"valid\",\"rollback_suspected\":false}";
+  uint8_t hash[32], signature[160]; size_t signatureLen = 0;
+  mbedtls_sha256((const uint8_t*)payload.c_str(), payload.length(), hash, 0);
+  if (mbedtls_pk_sign(&telemetryKey, MBEDTLS_MD_SHA256, hash, sizeof(hash), signature, sizeof(signature), &signatureLen, telemetryRng, nullptr) != 0) return false;
+  String envelope = String("{\"v\":1,\"alg\":\"ES256\",\"device_id\":\"") + telemetryDeviceId +
+    "\",\"pubkey_b64\":\"" + telemetryBase64(telemetryPublicDer, telemetryPublicDerLen) + "\",\"payload_b64\":\"" + telemetryBase64((const uint8_t*)payload.c_str(), payload.length()) +
+    "\",\"sig_b64\":\"" + telemetryBase64(signature, signatureLen) + "\"}";
+  String topic = String("esp32-ota-lab/v1/") + TELEMETRY_NAMESPACE + "/" + telemetryDeviceId + "/status";
+  size_t tlen=topic.length(); size_t rem=2+tlen+envelope.length(); uint8_t header=0x30; telemetryClient.write(&header,1); while(rem){uint8_t b=rem%128;rem/=128;if(rem)b|=128;telemetryClient.write(&b,1);} uint8_t tl[2]={(uint8_t)(tlen>>8),(uint8_t)tlen}; telemetryClient.write(tl,2); telemetryClient.write((const uint8_t*)topic.c_str(),tlen); telemetryClient.write((const uint8_t*)envelope.c_str(),envelope.length()); telemetryNextAttempt=millis()+60000; return true;
+}
+
+void serviceTelemetry()
+{
+  if (otaHealthPending) return;
+  if (!telemetryKeyReady && !initializeTelemetryIdentity()) return;
+  if (millis() - telemetryLastPublish >= 60000 || telemetryLastPublish == 0)
+  { telemetryPublishStatus(); telemetryLastPublish = millis(); }
+}
+
 void setup()
 {
   Serial.begin(115200);
@@ -842,6 +953,7 @@ void setup()
 void loop()
 {
   serviceOtaHealth();
+  serviceTelemetry();
 
   if (configMode)
   {
