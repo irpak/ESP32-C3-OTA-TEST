@@ -9,6 +9,7 @@
 #include <time.h>
 #include <mbedtls/sha256.h>
 #include <limits.h>
+#include <esp_ota_ops.h>
 
 // ======================================================
 // ESP32-C3 OTA TEST
@@ -22,7 +23,7 @@
 // - aktualizacja tylko do wersji NOWSZEJ
 // ======================================================
 
-#define CURRENT_VERSION "1.0.8"
+#define CURRENT_VERSION "1.0.9"
 
 const char* VERSION_URL =
   "https://raw.githubusercontent.com/irpak/ESP32-C3-OTA-TEST/main/ota/version.txt";
@@ -39,6 +40,18 @@ String savedPassword;
 String setupAPName;
 
 bool configMode = false;
+
+// Defer the core's automatic PENDING_VERIFY decision until loop() has
+// completed a local, network-independent probation period.
+extern "C" bool verifyRollbackLater()
+{
+  return true;
+}
+
+bool otaHealthPending = false;
+unsigned long otaHealthStarted = 0;
+unsigned long otaHealthHeartbeats = 0;
+const unsigned long OTA_HEALTH_PROBATION_MS = 12000;
 
 unsigned long lastCheck = 0;
 const unsigned long CHECK_INTERVAL = 60000;
@@ -734,6 +747,61 @@ void checkForUpdate()
 }
 
 
+void initializeOtaHealth()
+{
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  esp_ota_img_states_t state;
+  if (running == nullptr || esp_ota_get_state_partition(running, &state) != ESP_OK)
+  {
+    Serial.println("OTA HEALTH: cannot read OTA state");
+    return;
+  }
+
+  if (state == ESP_OTA_IMG_PENDING_VERIFY)
+  {
+    otaHealthPending = true;
+    otaHealthStarted = millis();
+    otaHealthHeartbeats = 0;
+    Serial.println("OTA HEALTH: state=PENDING_VERIFY");
+    Serial.println("OTA HEALTH: probation start");
+  }
+}
+
+void serviceOtaHealth()
+{
+  if (!otaHealthPending)
+    return;
+
+  ++otaHealthHeartbeats;
+  if (millis() - otaHealthStarted < OTA_HEALTH_PROBATION_MS)
+    return;
+
+  Serial.println("OTA HEALTH: setup OK");
+  Serial.println("OTA HEALTH: loop heartbeat OK");
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  esp_ota_img_states_t state;
+  if (running == nullptr || esp_ota_get_state_partition(running, &state) != ESP_OK)
+  {
+    Serial.println("OTA HEALTH: cannot read OTA state");
+    return;
+  }
+  if (state != ESP_OTA_IMG_PENDING_VERIFY)
+  {
+    otaHealthPending = false;
+    return;
+  }
+  if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK)
+  {
+    otaHealthPending = false;
+    Serial.println("OTA HEALTH: PASS");
+    Serial.println("OTA HEALTH: firmware marked VALID");
+  }
+  else
+  {
+    Serial.println("OTA HEALTH: mark VALID failed");
+  }
+}
+
 // ======================================================
 // SETUP
 // ======================================================
@@ -762,6 +830,8 @@ void setup()
   {
     startConfigurationPortal();
   }
+
+  initializeOtaHealth();
 }
 
 
@@ -771,6 +841,8 @@ void setup()
 
 void loop()
 {
+  serviceOtaHealth();
+
   if (configMode)
   {
     dnsServer.processNextRequest();
