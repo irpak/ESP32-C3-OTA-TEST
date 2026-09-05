@@ -7,6 +7,7 @@
 #include <DNSServer.h>
 #include <time.h>
 #include <mbedtls/sha256.h>
+#include <limits.h>
 
 // ======================================================
 // ESP32-C3 OTA TEST
@@ -20,7 +21,7 @@
 // - aktualizacja tylko do wersji NOWSZEJ
 // ======================================================
 
-#define CURRENT_VERSION "1.0.5"
+#define CURRENT_VERSION "1.0.6"
 
 const char* VERSION_URL =
   "https://raw.githubusercontent.com/irpak/ESP32-C3-OTA-TEST/main/ota/version.txt";
@@ -78,11 +79,20 @@ bool parseVersion(const String& version, int& major, int& minor, int& patch)
         (parts[i].length() > 1 && parts[i][0] == '0'))
       return false;
 
+    int parsed = 0;
     for (size_t j = 0; j < parts[i].length(); ++j)
+    {
       if (parts[i][j] < '0' || parts[i][j] > '9')
         return false;
 
-    *numbers[i] = parts[i].toInt();
+      int digit = parts[i][j] - '0';
+      if (parsed > (INT_MAX - digit) / 10)
+        return false;
+
+      parsed = parsed * 10 + digit;
+    }
+
+    *numbers[i] = parsed;
   }
 
   return true;
