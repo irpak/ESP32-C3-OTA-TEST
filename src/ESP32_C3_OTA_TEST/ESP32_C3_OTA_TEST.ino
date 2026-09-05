@@ -20,7 +20,7 @@
 // - aktualizacja tylko do wersji NOWSZEJ
 // ======================================================
 
-#define CURRENT_VERSION "1.0.4"
+#define CURRENT_VERSION "1.0.5"
 
 const char* VERSION_URL =
   "https://raw.githubusercontent.com/irpak/ESP32-C3-OTA-TEST/main/ota/version.txt";
