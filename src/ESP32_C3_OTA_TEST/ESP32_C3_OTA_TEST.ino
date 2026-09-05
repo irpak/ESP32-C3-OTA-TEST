@@ -1,10 +1,12 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
-#include <HTTPUpdate.h>
+#include <Update.h>
 #include <Preferences.h>
 #include <WebServer.h>
 #include <DNSServer.h>
+#include <time.h>
+#include <mbedtls/sha256.h>
 
 // ======================================================
 // ESP32-C3 OTA TEST
@@ -18,7 +20,7 @@
 // - aktualizacja tylko do wersji NOWSZEJ
 // ======================================================
 
-#define CURRENT_VERSION "1.0.3"
+#define CURRENT_VERSION "1.0.4"
 
 const char* VERSION_URL =
   "https://raw.githubusercontent.com/irpak/ESP32-C3-OTA-TEST/main/ota/version.txt";
@@ -39,6 +41,11 @@ bool configMode = false;
 unsigned long lastCheck = 0;
 const unsigned long CHECK_INTERVAL = 60000;
 
+// The Arduino ESP32 3.3.11 build embeds the full Espressif CA bundle.
+// These symbols are exported by the local esp32c3 mbedTLS component.
+extern const uint8_t x509_crt_bundle[];
+extern const size_t x509_crt_bundle_length;
+
 
 // ======================================================
 // WERSJE
@@ -50,13 +57,35 @@ bool parseVersion(const String& version, int& major, int& minor, int& patch)
   minor = 0;
   patch = 0;
 
-  return sscanf(
-    version.c_str(),
-    "%d.%d.%d",
-    &major,
-    &minor,
-    &patch
-  ) == 3;
+  String value = version;
+  value.trim();
+  int first = value.indexOf('.');
+  int second = first < 0 ? -1 : value.indexOf('.', first + 1);
+
+  if (first <= 0 || second <= first + 1 || value.indexOf('.', second + 1) >= 0)
+    return false;
+
+  String parts[3] = {
+    value.substring(0, first),
+    value.substring(first + 1, second),
+    value.substring(second + 1)
+  };
+
+  int* numbers[3] = {&major, &minor, &patch};
+  for (int i = 0; i < 3; ++i)
+  {
+    if (parts[i].length() == 0 ||
+        (parts[i].length() > 1 && parts[i][0] == '0'))
+      return false;
+
+    for (size_t j = 0; j < parts[i].length(); ++j)
+      if (parts[i][j] < '0' || parts[i][j] > '9')
+        return false;
+
+    *numbers[i] = parts[i].toInt();
+  }
+
+  return true;
 }
 
 
@@ -388,6 +417,224 @@ void startConfigurationPortal()
 // OTA
 // ======================================================
 
+bool synchronizeClock()
+{
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+
+  time_t now = time(nullptr);
+  unsigned long started = millis();
+
+  while (now < 8 * 3600 * 2 && millis() - started < 30000)
+  {
+    delay(250);
+    now = time(nullptr);
+  }
+
+  if (now < 8 * 3600 * 2)
+  {
+    Serial.println("TLS: brak poprawnego czasu NTP.");
+    return false;
+  }
+
+  return true;
+}
+
+void configureSecureClient(WiFiClientSecure& client)
+{
+  client.setCACertBundle(x509_crt_bundle, x509_crt_bundle_length);
+  client.setTimeout(12000);
+  client.setHandshakeTimeout(15);
+}
+
+bool isSha256Hex(const String& value)
+{
+  if (value.length() != 64)
+    return false;
+
+  for (size_t i = 0; i < value.length(); ++i)
+  {
+    char c = value[i];
+    bool digit = c >= '0' && c <= '9';
+    bool lower = c >= 'a' && c <= 'f';
+    bool upper = c >= 'A' && c <= 'F';
+
+    if (!digit && !lower && !upper)
+      return false;
+  }
+
+  return true;
+}
+
+String readExpectedFirmwareSha256()
+{
+  const char* shaURL =
+    "https://raw.githubusercontent.com/irpak/ESP32-C3-OTA-TEST/main/ota/firmware.sha256";
+
+  WiFiClientSecure client;
+  configureSecureClient(client);
+
+  HTTPClient https;
+  if (!https.begin(client, shaURL))
+  {
+    Serial.println("SHA: nie mozna otworzyc firmware.sha256.");
+    return String();
+  }
+
+  int httpCode = https.GET();
+  if (httpCode != HTTP_CODE_OK)
+  {
+    Serial.print("SHA: blad HTTP: ");
+    Serial.println(httpCode);
+    https.end();
+    return String();
+  }
+
+  String document = https.getString();
+  https.end();
+
+  if (document.endsWith("\r\n"))
+    document.remove(document.length() - 2);
+  else if (document.endsWith("\n"))
+    document.remove(document.length() - 1);
+
+  if (document.length() != 78 ||
+      document.substring(64, 66) != "  " ||
+      document.substring(66) != "firmware.bin")
+  {
+    Serial.println("SHA: nieprawidlowy format manifestu.");
+    return String();
+  }
+
+  String expected = document.substring(0, 64);
+
+  if (!isSha256Hex(expected))
+  {
+    Serial.println("SHA: nieprawidlowy format SHA-256.");
+    return String();
+  }
+
+  expected.toLowerCase();
+  return expected;
+}
+
+bool downloadAndVerifyFirmware(const String& expectedSha)
+{
+  WiFiClientSecure client;
+  configureSecureClient(client);
+
+  HTTPClient https;
+  if (!https.begin(client, FIRMWARE_URL))
+  {
+    Serial.println("OTA: nie mozna otworzyc firmware.bin.");
+    return false;
+  }
+
+  int httpCode = https.GET();
+  if (httpCode != HTTP_CODE_OK)
+  {
+    Serial.print("OTA: blad HTTP firmware.bin: ");
+    Serial.println(httpCode);
+    https.end();
+    return false;
+  }
+
+  int contentLength = https.getSize();
+  if (contentLength <= 0)
+  {
+    Serial.println("OTA: nieprawidlowy rozmiar firmware.");
+    https.end();
+    return false;
+  }
+
+  if (!Update.begin((size_t)contentLength, U_FLASH))
+  {
+    Serial.print("OTA: Update.begin: ");
+    Serial.println(Update.errorString());
+    https.end();
+    return false;
+  }
+
+  mbedtls_sha256_context sha;
+  mbedtls_sha256_init(&sha);
+
+  bool ok = mbedtls_sha256_starts(&sha, 0) == 0;
+  size_t written = 0;
+  uint8_t buffer[1024];
+  WiFiClient* stream = https.getStreamPtr();
+
+  while (ok && written < (size_t)contentLength)
+  {
+    size_t available = stream->available();
+
+    if (available > 0)
+    {
+      size_t want = min(available, sizeof(buffer));
+      int received = stream->readBytes(buffer, want);
+
+      if (received <= 0 || Update.write(buffer, received) != (size_t)received)
+      {
+        ok = false;
+        break;
+      }
+
+      if (mbedtls_sha256_update(&sha, buffer, received) != 0)
+      {
+        ok = false;
+        break;
+      }
+
+      written += (size_t)received;
+    }
+    else if (!https.connected())
+    {
+      ok = false;
+      break;
+    }
+    else
+    {
+      delay(1);
+    }
+  }
+
+  unsigned char calculated[32];
+  if (ok && written == (size_t)contentLength)
+    ok = mbedtls_sha256_finish(&sha, calculated) == 0;
+  else
+    mbedtls_sha256_finish(&sha, calculated);
+
+  mbedtls_sha256_free(&sha);
+  https.end();
+
+  if (!ok || written != (size_t)contentLength)
+  {
+    Update.abort();
+    Serial.println("OTA: niepelne pobranie albo blad zapisu.");
+    return false;
+  }
+
+  char calculatedText[65];
+  for (size_t i = 0; i < 32; ++i)
+    snprintf(calculatedText + (i * 2), 3, "%02x", calculated[i]);
+  calculatedText[64] = '\0';
+
+  if (expectedSha != String(calculatedText))
+  {
+    Update.abort();
+    Serial.println("OTA: SHA-256 firmware niezgodne — obraz odrzucony.");
+    return false;
+  }
+
+  // Partition is activated only after complete download and SHA match.
+  if (!Update.end(false) || !Update.isFinished())
+  {
+    Serial.print("OTA: Update.end: ");
+    Serial.println(Update.errorString());
+    return false;
+  }
+
+  return true;
+}
+
 void checkForUpdate()
 {
   if (WiFi.status() != WL_CONNECTED)
@@ -403,11 +650,11 @@ void checkForUpdate()
   Serial.print("Aktualna wersja: ");
   Serial.println(CURRENT_VERSION);
 
-  WiFiClientSecure client;
+  if (!synchronizeClock())
+    return;
 
-  // LABORATORIUM.
-  // Później dodamy prawidlowa walidacje TLS.
-  client.setInsecure();
+  WiFiClientSecure client;
+  configureSecureClient(client);
 
   HTTPClient https;
 
@@ -453,41 +700,18 @@ void checkForUpdate()
   Serial.print(" -> ");
   Serial.println(remoteVersion);
 
+  Serial.println("Pobieram firmware.sha256...");
+  String expectedSha = readExpectedFirmwareSha256();
+  if (expectedSha.length() != 64)
+    return;
+
   Serial.println("Pobieram firmware.bin...");
+  if (!downloadAndVerifyFirmware(expectedSha))
+    return;
 
-  WiFiClientSecure updateClient;
-  updateClient.setInsecure();
-
-  t_httpUpdate_return result =
-    httpUpdate.update(
-      updateClient,
-      FIRMWARE_URL
-    );
-
-  switch (result)
-  {
-    case HTTP_UPDATE_FAILED:
-
-      Serial.printf(
-        "OTA BLAD (%d): %s\n",
-        httpUpdate.getLastError(),
-        httpUpdate.getLastErrorString().c_str()
-      );
-
-      break;
-
-
-    case HTTP_UPDATE_NO_UPDATES:
-
-      Serial.println("OTA: brak aktualizacji.");
-      break;
-
-
-    case HTTP_UPDATE_OK:
-
-      Serial.println("OTA OK.");
-      break;
-  }
+  Serial.println("OTA OK — SHA-256 zweryfikowane.");
+  delay(1000);
+  ESP.restart();
 }
 
 
