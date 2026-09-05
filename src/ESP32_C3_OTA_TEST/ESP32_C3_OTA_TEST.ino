@@ -2,6 +2,7 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <Update.h>
+#include "public_key.h"
 #include <Preferences.h>
 #include <WebServer.h>
 #include <DNSServer.h>
@@ -21,7 +22,7 @@
 // - aktualizacja tylko do wersji NOWSZEJ
 // ======================================================
 
-#define CURRENT_VERSION "1.0.6"
+#define CURRENT_VERSION "1.0.7"
 
 const char* VERSION_URL =
   "https://raw.githubusercontent.com/irpak/ESP32-C3-OTA-TEST/main/ota/version.txt";
@@ -552,6 +553,14 @@ bool downloadAndVerifyFirmware(const String& expectedSha)
   if (contentLength <= 0)
   {
     Serial.println("OTA: nieprawidlowy rozmiar firmware.");
+    https.end();
+    return false;
+  }
+
+  UpdaterECDSAVerifier signatureVerifier(PUBLIC_KEY, PUBLIC_KEY_LEN, HASH_SHA256);
+  if (!Update.installSignature(&signatureVerifier))
+  {
+    Serial.println("OTA: nie mozna zainstalowac weryfikacji podpisu.");
     https.end();
     return false;
   }
