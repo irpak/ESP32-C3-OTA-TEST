@@ -26,7 +26,7 @@
 // - aktualizacja tylko do wersji NOWSZEJ
 // ======================================================
 
-#define CURRENT_VERSION "1.0.11"
+#define CURRENT_VERSION "1.0.12"
 
 const char* VERSION_URL =
   "https://raw.githubusercontent.com/irpak/ESP32-C3-OTA-TEST/main/ota/version.txt";
@@ -812,6 +812,7 @@ void serviceOtaHealth()
   }
   if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK)
   {
+    Preferences marker; if (marker.begin("ota", false)) { marker.putBool("boot_expected", false); marker.putString("ota_result", "health_valid"); marker.end(); }
     otaHealthPending = false;
     Serial.println("OTA HEALTH: PASS");
     Serial.println("OTA HEALTH: firmware marked VALID");
@@ -903,23 +904,17 @@ bool telemetryPublishStatus()
   {
     telemetryClient.setCACertBundle(x509_crt_bundle, x509_crt_bundle_length);
     if (!telemetryClient.connect(TELEMETRY_BROKER, TELEMETRY_PORT)) { telemetryNextAttempt=millis()+telemetryBackoff; telemetryBackoff=min<uint32_t>(telemetryBackoff*2,60000); return false; }
-    String clientId = String("ota-") + telemetryDeviceId.substring(0,12); uint8_t cp[64]; size_t cn=0; cp[cn++]=0x10; size_t rem=10+2+2+clientId.length(); uint8_t enc[4]; int ei=0; do{uint8_t b=rem%128;rem/=128;if(rem)b|=128;enc[ei++]=b;}while(rem); for(int i=0;i<ei;i++)cp[cn++]=enc[i]; cp[cn++]=0;cp[cn++]=4;memcpy(cp+cn,"MQTT",4);cn+=4;cp[cn++]=4;cp[cn++]=2;cp[cn++]=0;cp[cn++]=60;cp[cn++]=clientId.length()>>8;cp[cn++]=clientId.length();memcpy(cp+cn,clientId.c_str(),clientId.length());cn+=clientId.length(); telemetryClient.write(cp,cn);
+    String clientId = String("ota-") + telemetryDeviceId.substring(0,12); uint8_t cp[64]; size_t cn=0; cp[cn++]=0x10;
+    size_t rem=10+2+clientId.length(); uint8_t enc[4]; int ei=0; do{uint8_t b=rem%128;rem/=128;if(rem)b|=128;enc[ei++]=b;}while(rem); for(int i=0;i<ei;i++)cp[cn++]=enc[i];
+    cp[cn++]=0;cp[cn++]=4;memcpy(cp+cn,"MQTT",4);cn+=4;cp[cn++]=4;cp[cn++]=2;cp[cn++]=0;cp[cn++]=60;cp[cn++]=clientId.length()>>8;cp[cn++]=clientId.length();memcpy(cp+cn,clientId.c_str(),clientId.length());cn+=clientId.length();
+    if (telemetryClient.write(cp,cn)!=(int)cn) { telemetryClient.stop(); return false; }
     unsigned long wait=millis(); while(telemetryClient.available()<4 && millis()-wait<2000) yield(); if(telemetryClient.available()<4 || telemetryClient.read()!=0x20 || telemetryClient.read()!=0x02 || telemetryClient.read()!=0x00 || telemetryClient.read()!=0x00) { telemetryClient.stop(); return false; } telemetryBackoff=5000;
   }
-  ++telemetrySeq;
-  String payload = String("{\"schema_version\":1,\"device_id\":\"") + telemetryDeviceId +
-    "\",\"chip_family\":\"ESP32-C3\",\"fw_version\":\"" + CURRENT_VERSION +
-    "\",\"seq\":" + String((unsigned long long)telemetrySeq) +
-    ",\"uptime_s\":" + String(millis() / 1000) + ",\"wifi_connected\":true,\"wifi_rssi\":" + String(WiFi.RSSI()) +
-    ",\"ota_state\":\"stable\",\"ota_result\":\"no_update\",\"health_state\":\"valid\",\"rollback_suspected\":" + String(telemetryRollbackSuspected ? "true" : "false") + "}";
-  uint8_t hash[32], signature[160]; size_t signatureLen = 0;
-  mbedtls_sha256((const uint8_t*)payload.c_str(), payload.length(), hash, 0);
-  if (mbedtls_pk_sign(&telemetryKey, MBEDTLS_MD_SHA256, hash, sizeof(hash), signature, sizeof(signature), &signatureLen, telemetryRng, nullptr) != 0) return false;
-  String envelope = String("{\"v\":1,\"alg\":\"ES256\",\"device_id\":\"") + telemetryDeviceId +
-    "\",\"pubkey_b64\":\"" + telemetryBase64(telemetryPublicDer, telemetryPublicDerLen) + "\",\"payload_b64\":\"" + telemetryBase64((const uint8_t*)payload.c_str(), payload.length()) +
-    "\",\"sig_b64\":\"" + telemetryBase64(signature, signatureLen) + "\"}";
-  String topic = String("esp32-ota-lab/v1/") + TELEMETRY_NAMESPACE + "/" + telemetryDeviceId + "/status";
-  size_t tlen=topic.length(); size_t rem=2+tlen+envelope.length(); uint8_t header=0x31; telemetryClient.write(&header,1); while(rem){uint8_t b=rem%128;rem/=128;if(rem)b|=128;telemetryClient.write(&b,1);} uint8_t tl[2]={(uint8_t)(tlen>>8),(uint8_t)tlen}; telemetryClient.write(tl,2); telemetryClient.write((const uint8_t*)topic.c_str(),tlen); telemetryClient.write((const uint8_t*)envelope.c_str(),envelope.length()); telemetryNextAttempt=millis()+60000; return true;
+  ++telemetrySeq; String payload = String("{\"schema_version\":1,\"device_id\":\"") + telemetryDeviceId + "\",\"chip_family\":\"ESP32-C3\",\"fw_version\":\"" + CURRENT_VERSION + "\",\"boot_id\":\"" + String(telemetryBootId) + "\",\"seq\":" + String((unsigned long long)telemetrySeq) + ",\"uptime_s\":" + String(millis() / 1000) + ",\"wifi_connected\":true,\"wifi_rssi\":" + String(WiFi.RSSI()) + ",\"ota_state\":\"stable\",\"ota_result\":\"no_update\",\"health_state\":\"valid\",\"rollback_suspected\":" + String(telemetryRollbackSuspected ? "true" : "false") + "}";
+  uint8_t hash[32], signature[160]; size_t signatureLen = 0; mbedtls_sha256((const uint8_t*)payload.c_str(), payload.length(), hash, 0); if (mbedtls_pk_sign(&telemetryKey, MBEDTLS_MD_SHA256, hash, sizeof(hash), signature, sizeof(signature), &signatureLen, telemetryRng, nullptr) != 0) return false;
+  String envelope = String("{\"v\":1,\"alg\":\"ES256\",\"device_id\":\"") + telemetryDeviceId + "\",\"pubkey_b64\":\"" + telemetryBase64(telemetryPublicDer, telemetryPublicDerLen) + "\",\"payload_b64\":\"" + telemetryBase64((const uint8_t*)payload.c_str(), payload.length()) + "\",\"sig_b64\":\"" + telemetryBase64(signature, signatureLen) + "\"}";
+  size_t rem = 0;
+  String topic = String("esp32-ota-lab/v1/") + TELEMETRY_NAMESPACE + "/" + telemetryDeviceId + "/status"; size_t tlen=topic.length(); rem=2+tlen+envelope.length(); uint8_t header=0x31; telemetryClient.write(&header,1); while(rem){uint8_t b=rem%128;rem/=128;if(rem)b|=128;telemetryClient.write(&b,1);} uint8_t tl[2]={(uint8_t)(tlen>>8),(uint8_t)tlen}; telemetryClient.write(tl,2); telemetryClient.write((const uint8_t*)topic.c_str(),tlen); telemetryClient.write((const uint8_t*)envelope.c_str(),envelope.length()); telemetryNextAttempt=millis()+60000; return true;
 }
 
 void serviceTelemetry()
